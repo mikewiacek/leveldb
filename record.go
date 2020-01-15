@@ -57,13 +57,13 @@
 //		return records.Close()
 //	}
 //
-// The wire format is that the stream is divided into 32KiB blocks, and each
+// The wire format is that the stream is divided into 2MiB blocks, and each
 // block contains a number of tightly packed chunks. Chunks cannot cross block
-// boundaries. The last block may be shorter than 32 KiB. Any unused bytes in a
+// boundaries. The last block may be shorter than 2 MiB. Any unused bytes in a
 // block must be zero.
 //
-// A record maps to one or more chunks. Each chunk has a 7 byte header (a 4
-// byte checksum, a 2 byte little-endian uint16 length, and a 1 byte chunk type)
+// A record maps to one or more chunks. Each chunk has a 8 byte header (a 4
+// byte checksum, a 3 byte little-endian uint24 length, and a 1 byte chunk type)
 // followed by a payload. The checksum is over the chunk type and the payload.
 //
 // There are four chunk types: whether the chunk is the full record, or the
@@ -73,7 +73,7 @@
 // The wire format allows for limited recovery in the face of data corruption:
 // on a format error (such as a checksum mismatch), the reader moves to the
 // next block and looks for the next full or first chunk.
-package record // import "github.com/golang/leveldb/record"
+package record
 
 // The C++ Level-DB code calls this the log, but it has been renamed to record
 // to avoid clashing with the standard log package, and because it is generally
@@ -97,17 +97,20 @@ const (
 )
 
 const (
-	blockSize     = 32 * 1024
+	blockSize     = 2 * 1024 * 1024
 	blockSizeMask = blockSize - 1
-	headerSize    = 7
+	headerSize    = 8
 )
 
 var (
 	// ErrNotAnIOSeeker is returned if the io.Reader underlying a Reader does not implement io.Seeker.
-	ErrNotAnIOSeeker = errors.New("leveldb/record: reader does not implement io.Seeker")
+	ErrNotAnIOSeeker = errors.New("record: reader does not implement io.Seeker")
 
 	// ErrNoLastRecord is returned if LastRecordOffset is called and there is no previous record.
-	ErrNoLastRecord = errors.New("leveldb/record: no last record exists")
+	ErrNoLastRecord = errors.New("record: no last record exists")
+
+	// ErrBlockAppearsZeroed is returned if a call to read data find zero'ed data in chunk header.
+	ErrBlockAppearsZeroed = errors.New("record: block appears to be zeroed")
 )
 
 type flusher interface {
@@ -145,14 +148,32 @@ func NewReader(r io.Reader) *Reader {
 	}
 }
 
+// uint32FromUint24LittleEndian essentially is the same as binary.LittleEndian.Uint32 except it
+// assumes b is only 24 bites (3 bytes) and returns a uint32. The fourth byte is treated as 0.
+func uint32FromUint24LittleEndian(b []byte) uint32 {
+	_ = b[2] // bounds check hint to compiler; see golang.org/issue/14808
+	return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(0)<<24
+}
+
+// putUint24FromUint32LittleEndian essentially is the same as binary.LittleEndian.PutUint32.
+// It assumes that v is less than 2 >> 24. If it's more than that, functionality is undefined.
+// In practice, v should always be less than blockSize but that is not enforced by this function.
+func putUint24FromUint32LittleEndian(b []byte, v uint32) {
+	_ = b[2] // early bounds check to guarantee safety of writes below
+
+	b[0] = byte(v)
+	b[1] = byte(v >> 8)
+	b[2] = byte(v >> 16)
+}
+
 // nextChunk sets r.buf[r.i:r.j] to hold the next chunk's payload, reading the
 // next block into the buffer if necessary.
 func (r *Reader) nextChunk(wantFirst bool) error {
 	for {
 		if r.j+headerSize <= r.n {
 			checksum := binary.LittleEndian.Uint32(r.buf[r.j+0 : r.j+4])
-			length := binary.LittleEndian.Uint16(r.buf[r.j+4 : r.j+6])
-			chunkType := r.buf[r.j+6]
+			length := uint32FromUint24LittleEndian(r.buf[r.j+4 : r.j+7])
+			chunkType := r.buf[r.j+7]
 
 			if checksum == 0 && length == 0 && chunkType == 0 {
 				if wantFirst || r.recovering {
@@ -161,11 +182,11 @@ func (r *Reader) nextChunk(wantFirst bool) error {
 					// via mmap.
 					//
 					// Set r.err to be an error so r.Recover actually recovers.
-					r.err = errors.New("leveldb/record: block appears to be zeroed")
+					r.err = ErrBlockAppearsZeroed
 					r.Recover()
 					continue
 				}
-				return errors.New("leveldb/record: invalid chunk")
+				return ErrBlockAppearsZeroed
 			}
 
 			r.i = r.j + headerSize
@@ -175,14 +196,14 @@ func (r *Reader) nextChunk(wantFirst bool) error {
 					r.Recover()
 					continue
 				}
-				return errors.New("leveldb/record: invalid chunk (length overflows block)")
+				return errors.New("record: invalid chunk (length overflows block)")
 			}
 			if checksum != crc.New(r.buf[r.i-1:r.j]).Value() {
 				if r.recovering {
 					r.Recover()
 					continue
 				}
-				return errors.New("leveldb/record: invalid chunk (checksum mismatch)")
+				return errors.New("record: invalid chunk (checksum mismatch)")
 			}
 			if wantFirst {
 				if chunkType != fullChunkType && chunkType != firstChunkType {
@@ -199,7 +220,7 @@ func (r *Reader) nextChunk(wantFirst bool) error {
 			}
 			return io.EOF
 		}
-		n, err := io.ReadFull(r.r, r.buf[:])
+		n, err := io.ReadFull(r.r, r.buf[:]) // err will only be io.EOF is nothing was read.
 		if err != nil && err != io.ErrUnexpectedEOF {
 			return err
 		}
@@ -225,7 +246,7 @@ func (r *Reader) Next() (io.Reader, error) {
 }
 
 // Recover clears any errors read so far, so that calling Next will start
-// reading from the next good 32KiB block. If there are no such blocks, Next
+// reading from the next good 2MiB block. If there are no such blocks, Next
 // will return io.EOF. Recover also marks the current reader, the one most
 // recently returned by Next, as stale. If Recover is called without any
 // prior error, then Recover is a no-op.
@@ -254,9 +275,9 @@ func (r *Reader) Recover() {
 // encountered an error, including io.EOF. Such errors can be cleared by
 // calling Recover. Calling SeekRecord after Recover will make calling Next
 // return the record at the given offset, instead of the record at the next
-// good 32KiB block as Recover normally would. Calling SeekRecord before
+// good 2MiB block as Recover normally would. Calling SeekRecord before
 // Recover has no effect on Recover's semantics other than changing the
-// starting point for determining the next good 32KiB block.
+// starting point for determining the next good 2MiB block.
 //
 // The offset is always relative to the start of the underlying io.Reader, so
 // negative values will result in an error as per io.Seeker.
@@ -299,7 +320,7 @@ type singleReader struct {
 func (x singleReader) Read(p []byte) (int, error) {
 	r := x.r
 	if r.seq != x.seq {
-		return 0, errors.New("leveldb/record: stale reader")
+		return 0, errors.New("record: stale reader")
 	}
 	if r.err != nil {
 		return 0, r.err
@@ -373,23 +394,23 @@ func NewWriter(w io.Writer) *Writer {
 // fillHeader fills in the header for the pending chunk.
 func (w *Writer) fillHeader(last bool) {
 	if w.i+headerSize > w.j || w.j > blockSize {
-		panic("leveldb/record: bad writer state")
+		panic("record: bad writer state")
 	}
 	if last {
 		if w.first {
-			w.buf[w.i+6] = fullChunkType
+			w.buf[w.i+7] = fullChunkType
 		} else {
-			w.buf[w.i+6] = lastChunkType
+			w.buf[w.i+7] = lastChunkType
 		}
 	} else {
 		if w.first {
-			w.buf[w.i+6] = firstChunkType
+			w.buf[w.i+7] = firstChunkType
 		} else {
-			w.buf[w.i+6] = middleChunkType
+			w.buf[w.i+7] = middleChunkType
 		}
 	}
-	binary.LittleEndian.PutUint32(w.buf[w.i+0:w.i+4], crc.New(w.buf[w.i+6:w.j]).Value())
-	binary.LittleEndian.PutUint16(w.buf[w.i+4:w.i+6], uint16(w.j-w.i-headerSize))
+	binary.LittleEndian.PutUint32(w.buf[w.i+0:w.i+4], crc.New(w.buf[w.i+7:w.j]).Value())
+	putUint24FromUint32LittleEndian(w.buf[w.i+4:w.i+7], uint32(w.j-w.i-headerSize))
 }
 
 // writeBlock writes the buffered block to the underlying writer, and reserves
@@ -423,7 +444,7 @@ func (w *Writer) Close() error {
 	if w.err != nil {
 		return w.err
 	}
-	w.err = errors.New("leveldb/record: closed Writer")
+	w.err = errors.New("record: closed Writer")
 	return nil
 }
 
@@ -501,7 +522,7 @@ type singleWriter struct {
 func (x singleWriter) Write(p []byte) (int, error) {
 	w := x.w
 	if w.seq != x.seq {
-		return 0, errors.New("leveldb/record: stale writer")
+		return 0, errors.New("record: stale writer")
 	}
 	if w.err != nil {
 		return 0, w.err

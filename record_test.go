@@ -39,6 +39,37 @@ func TestZeroBlocks(t *testing.T) {
 	}
 }
 
+func TestZeroBlocksFollowedByRealBlock(t *testing.T) {
+	buf := new(bytes.Buffer)
+	w := NewWriter(buf)
+	ww, err := w.Next()
+	if err != nil {
+		t.Fatalf("writer.Next: %v", err)
+	}
+	if _, err := ww.Write([]byte("short message here")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("writer.Close: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		b := make([]byte, (i+1)*blockSize)
+		copy(b[i*blockSize:], buf.Bytes())
+		r := NewReader(bytes.NewReader(b))
+		rr, err := r.Next()
+		if err != nil {
+			t.Fatalf("%d blocks: got %v, want %v", i+1, err, nil)
+		}
+		output := make([]byte, len("short message here"))
+		if _, err := rr.Read(output); err != nil {
+			t.Fatalf("Read: %v", err)
+		}
+		if string(output) != "short message here" {
+			t.Fatalf("Read: got %v, want %v", string(output), "short message here")
+		}
+	}
+}
+
 func testGenerator(t *testing.T, reset func(), gen func() (string, bool)) {
 	buf := new(bytes.Buffer)
 
@@ -167,49 +198,49 @@ func TestFlush(t *testing.T) {
 	if got, want := buf.Len(), 0; got != want {
 		t.Fatalf("buffer length #0: got %d want %d", got, want)
 	}
-	// Flush the record.Writer buffer, which should yield 17 bytes.
-	// 17 = 2*7 + 1 + 2, which is two headers and 1 + 2 payload bytes.
+	// Flush the record.Writer buffer, which should yield 19 bytes.
+	// 19 = 2*8 + 1 + 2, which is two headers and 1 + 2 payload bytes.
 	if err := w.Flush(); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := buf.Len(), 17; got != want {
+	if got, want := buf.Len(), 19; got != want {
 		t.Fatalf("buffer length #1: got %d want %d", got, want)
 	}
 	// Do another write, one that isn't large enough to complete the block.
 	// The write should not have flowed through to buf.
 	w2, _ := w.Next()
 	w2.Write(bytes.Repeat([]byte("2"), 10000))
-	if got, want := buf.Len(), 17; got != want {
+	if got, want := buf.Len(), 19; got != want {
 		t.Fatalf("buffer length #2: got %d want %d", got, want)
 	}
 	// Flushing should get us up to 10024 bytes written.
-	// 10024 = 17 + 7 + 10000.
+	// 10027 = 19 + 8 + 10000.
 	if err := w.Flush(); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := buf.Len(), 10024; got != want {
+	if got, want := buf.Len(), 10027; got != want {
 		t.Fatalf("buffer length #3: got %d want %d", got, want)
 	}
 	// Do a bigger write, one that completes the current block.
-	// We should now have 32768 bytes (a complete block), without
+	// We should now have 2 MiB (a complete block), without
 	// an explicit flush.
 	w3, _ := w.Next()
-	w3.Write(bytes.Repeat([]byte("3"), 40000))
-	if got, want := buf.Len(), 32768; got != want {
+	w3.Write(bytes.Repeat([]byte("3"), 2*1024*1024))
+	if got, want := buf.Len(), 2*1024*1024; got != want {
 		t.Fatalf("buffer length #4: got %d want %d", got, want)
 	}
 	// Flushing should get us up to 50038 bytes written.
-	// 50038 = 10024 + 2*7 + 40000. There are two headers because
+	// 2107195 = 10027 + 2*8 + 2097152. There are two headers because
 	// the one record was split into two chunks.
 	if err := w.Flush(); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := buf.Len(), 50038; got != want {
+	if got, want := buf.Len(), 2107195; got != want {
 		t.Fatalf("buffer length #5: got %d want %d", got, want)
 	}
 	// Check that reading those records give the right lengths.
 	r := NewReader(buf)
-	wants := []int64{1, 2, 10000, 40000}
+	wants := []int64{1, 2, 10000, 2097152}
 	for i, want := range wants {
 		rr, _ := r.Next()
 		n, err := io.Copy(ioutil.Discard, rr)
@@ -728,7 +759,7 @@ func TestSeekRecord(t *testing.T) {
 	check(1)
 
 	// Now seek past the end of the file and verify it causes an error.
-	err = r.SeekRecord(1 << 20)
+	err = r.SeekRecord(20 << 20)
 	if err == nil {
 		t.Fatalf("Seek past the end of a file didn't cause an error")
 	}
@@ -762,7 +793,7 @@ func TestLastRecordOffset(t *testing.T) {
 		t.Fatalf("makeTestRecords: %v", err)
 	}
 
-	wants := []int64{0, 98332, 131072, 163840, 196608}
+	wants := []int64{0, 6291488, 8388608, 10485760, 12582912}
 	for i, got := range recs.offsets {
 		if want := wants[i]; got != want {
 			t.Errorf("record #%d: got %d, want %d", i, got, want)
